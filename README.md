@@ -1,3 +1,14 @@
+---
+title: Recommendation Agent
+emoji: 🎬
+colorFrom: indigo
+colorTo: blue
+sdk: gradio
+sdk_version: 4.0.0
+app_file: app.py
+pinned: false
+---
+
 # 🎬 Movie Recommendation OpenEnv Project
 
 A complete **OpenEnv** implementation for training language models to generate better movie recommendations using **GRPO** (Group Relative Policy Optimization) and Meta's OpenEnv framework.
