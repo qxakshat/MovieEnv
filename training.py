@@ -7,7 +7,7 @@ using Group Relative Policy Optimization (GRPO) via TRL.
 Based on Meta's OpenEnv and Hugging Face's TRL framework.
 
 Usage:
-    python training.py --model-id HuggingFaceTB/SmolLM2-135M-Instruct --num-epochs 3
+    python training.py --model-id meta-llama/Llama-3.2-1B-Instruct --num-epochs 3
     
     # With device selection
     python training.py --device cuda    # NVIDIA GPU (fastest)
@@ -17,7 +17,6 @@ Usage:
     # Auto-detects best available device if --device not specified
 
 Requirements:
-    - trl[vllm]
     - transformers
     - peft
     - torch >= 2.0.0
@@ -45,13 +44,6 @@ from transformers import AutoTokenizer
 
 from trl import GRPOConfig, GRPOTrainer
 
-# Try importing vLLM-based generation, but have a fallback
-try:
-    from trl.experimental.openenv import generate_rollout_completions
-    HAS_VLLM = True
-except (ImportError, RuntimeError):
-    HAS_VLLM = False
-
 # Add src to path
 sys.path.insert(0, str(Path(__file__).parent / "src"))
 
@@ -78,12 +70,12 @@ def parse_args() -> argparse.Namespace:
     # Model configuration
     parser.add_argument(
         "--model-id",
-        default="HuggingFaceTB/SmolLM2-135M-Instruct",
+        default="meta-llama/Llama-3.2-1B-Instruct",
         help="Model identifier for fine-tuning (Hugging Face model hub)",
     )
     parser.add_argument(
         "--tokenizer-id",
-        default="HuggingFaceTB/SmolLM2-135M-Instruct",
+        default="meta-llama/Llama-3.2-1B-Instruct",
         help="Tokenizer identifier (usually same as model)",
     )
 
@@ -216,8 +208,12 @@ def resolve_system_prompt(path: str) -> str:
     if not prompt_path.is_file():
         prompt_path = Path(__file__).parent / "src" / path
     if prompt_path.is_file():
-        return prompt_path.read_text()
-    return "You are an expert movie recommendation agent."
+        content = prompt_path.read_text()
+        print(f"✓ System prompt loaded from {prompt_path} ({len(content)} chars)", flush=True)
+        return content
+    
+    print(f"⚠️  System prompt file not found at {path}, using default", flush=True)
+    return "You are a helpful movie recommendation assistant. Recommend movies based on user preferences."
 
 
 def sanitize_name(name: str) -> str:
@@ -226,36 +222,59 @@ def sanitize_name(name: str) -> str:
 
 
 def format_history(messages: Iterable[Message]) -> str:
-    """Format message history for model input."""
+    """Format message history for model input — only recommendations and feedback."""
     lines = []
     for message in messages:
-        tag = message.category
+        # Skip PROMPT and USER_PROFILE to avoid duplicating context already in system prompt
+        if message.category not in ("RECOMMENDATION", "FEEDBACK"):
+            continue
         content = message.content.strip()
         if not content:
             continue
-        lines.append(f"[{tag}] {content}")
-    return "\n".join(lines)
+        lines.append(f"{message.category}: {content[:80]}")
+    return "\n".join(lines[-6:])  # Keep last 6 turns at most
 
 
 def make_user_prompt(prompt_text: str, messages: Iterable[Message]) -> str:
-    """Build user prompt combining task and history."""
+    """Build a compact user prompt - extract key user info and recent history only."""
+    # Extract genre and rating from prompt_text (avoid passing whole profile)
+    genre_line = ""
+    rating_line = ""
+    for line in prompt_text.split("\n"):
+        if "Preferred Genres" in line and not genre_line:
+            genre_line = line.strip()
+        elif "Minimum Rating" in line and not rating_line:
+            rating_line = line.strip()
+    user_info = ", ".join(filter(None, [genre_line, rating_line])) or "Various genres"
+
     history = format_history(messages)
-    prompt_section = prompt_text.strip() if prompt_text.strip() else "Movie Recommendation Agent"
-    history_section = history if history else "[PROMPT] Awaiting first recommendation."
+    history_section = history if history else "None yet."
+
     return (
-        f"Task:\n{prompt_section}\n\n"
-        f"Conversation so far:\n{history_section}\n\n"
-        "Provide your next recommendation in square brackets."
+        f"{user_info}\n"
+        f"Previous recommendations:\n{history_section}\n"
+        "Reply with ONLY: [Movie Title]"
     )
 
 
 def extract_movie_recommendation(text: str) -> str | None:
     """Extract movie recommendation from model output."""
-    # Look for text in square brackets
     import re
-    match = re.search(r"\[([^\]]+)\]", text)
+
+    # Try 1: Look for text in square brackets
+    match = re.search(r"\[([^\]]{2,80})\]", text)
+    if match:
+        extracted = match.group(1).strip()
+        # Reject if no spaces and all lowercase (likely a garbage concatenation from prompt echo)
+        if extracted and (" " in extracted or extracted[0].isupper()):
+            return extracted
+
+    # Try 2: Quoted title
+    match = re.search(r'"([A-Z][^"]{2,79})"', text)
     if match:
         return match.group(1).strip()
+
+    # No fallback to raw text — too risky for a small model
     return None
 
 
@@ -302,7 +321,7 @@ def reward_overall_success(completions: list[str], **kwargs) -> list[float]:
 
 
 # ============================================================================
-# Fallback Generation (when vLLM is not available)
+# Generation (Direct inference without vLLM)
 # ============================================================================
 
 
@@ -315,40 +334,50 @@ def generate_completions_fallback(
     top_k: int = 10,
     top_p: float = 0.9,
 ) -> dict:
-    """Fallback completion generation without vLLM."""
+    """Direct completion generation using model inference."""
+    # Ensure model is in eval mode
+    trainer.model.eval()
+    
     # Tokenize prompt
     inputs = tokenizer(prompt, return_tensors="pt").to(trainer.model.device)
     prompt_ids = inputs["input_ids"][0].tolist()
     
-    # Generate with the model
-    with torch.no_grad():
-        outputs = trainer.model.generate(
-            **inputs,
-            max_new_tokens=max_new_tokens,
-            temperature=temperature,
-            top_k=top_k,
-            top_p=top_p,
-            do_sample=True,
-            return_dict_in_generate=True,
-            output_scores=True,
-        )
+    # Generate with the model - use more stable parameters
+    try:
+        with torch.no_grad():
+            outputs = trainer.model.generate(
+                **inputs,
+                max_new_tokens=min(max_new_tokens, 16),  # Reduce max tokens to avoid runaway
+                temperature=0.7,  # Slightly lower for stability
+                top_k=5,  # More conservative
+                top_p=0.9,
+                do_sample=True,
+                return_dict_in_generate=True,
+                output_scores=False,
+                pad_token_id=tokenizer.eos_token_id,
+                eos_token_id=tokenizer.eos_token_id,
+                repetition_penalty=1.2,  # Penalize repetition
+            )
+    except Exception as e:
+        print(f"  [ERROR] Generation failed: {e}", flush=True)
+        return {
+            "prompt_ids": prompt_ids,
+            "completion_ids": [],
+            "logprobs": [],
+            "text": "",
+        }
     
     completion_ids = outputs.sequences[0][len(prompt_ids):].tolist()
     
-    # Estimate log probabilities from scores
-    logprobs = []
-    if hasattr(outputs, "scores") and outputs.scores:
-        # Use transition scores as proxy for log probabilities
-        # This is a simplified estimate
-        for score in outputs.scores:
-            max_score = score.max(dim=-1)[0].mean().item()
-            logprobs.append(max_score / 100.0)  # Normalize
-    else:
-        # Default: assume uniform log probabilities
-        logprobs = [0.0] * len(completion_ids)
+    # Default log probabilities (since we disabled output_scores)
+    logprobs = [0.0] * len(completion_ids)
     
-    # Decode completion text
-    text = tokenizer.decode(completion_ids, skip_special_tokens=True)
+    # Decode completion text with error handling
+    try:
+        text = tokenizer.decode(completion_ids, skip_special_tokens=True).strip()
+    except Exception as e:
+        print(f"  [ERROR] Decoding failed: {e}", flush=True)
+        text = ""
     
     return {
         "prompt_ids": prompt_ids,
@@ -376,6 +405,10 @@ def rollout_once(
     
     Returns dict with prompt_ids, completion_ids, logprobs, and reward signals.
     """
+    # Validate inputs
+    if not system_prompt or len(system_prompt) < 10:
+        print(f"  [WARNING] System prompt seems too short: {len(system_prompt)} chars", flush=True)
+    
     result = env.reset()
     observation = result.observation
 
@@ -407,23 +440,26 @@ def rollout_once(
             tokenize=False,
         )
 
-        # Generate recommendation
-        try:
-            if HAS_VLLM:
-                rollout_outputs = generate_rollout_completions(trainer, [prompt_text])[0]
-            else:
-                raise RuntimeError("vLLM not available")
-        except (RuntimeError, AttributeError):
-            # Fall back to direct generation if vLLM fails
-            rollout_outputs = generate_completions_fallback(
-                trainer=trainer,
-                tokenizer=tokenizer,
-                prompt=prompt_text,
-                max_new_tokens=32,
-                temperature=0.8,
-                top_k=10,
-                top_p=0.9,
-            )
+        # Debug: Print prompts on first turn only
+        if turn == 0:
+            print(f"  [DEBUG PROMPT] System prompt (first 150 chars): {system_prompt[:150]!r}", flush=True)
+            print(f"  [DEBUG PROMPT] User prompt (first 200 chars): {user_prompt[:200]!r}", flush=True)
+            print(f"  [DEBUG PROMPT] Full prompt_text length: {len(prompt_text)} chars", flush=True)
+            print(f"  [DEBUG PROMPT] First 300 chars of formatted prompt: {prompt_text[:300]!r}", flush=True)
+
+        # Generate recommendation using direct inference
+        if turn == 0:
+            print(f"  [DEBUG] Using direct model generation", flush=True)
+        
+        rollout_outputs = generate_completions_fallback(
+            trainer=trainer,
+            tokenizer=tokenizer,
+            prompt=prompt_text,
+            max_new_tokens=32,
+            temperature=0.8,
+            top_k=10,
+            top_p=0.9,
+        )
         
         prompt_ids.extend(rollout_outputs["prompt_ids"])
         completion_ids.extend(rollout_outputs["completion_ids"])
@@ -432,10 +468,26 @@ def rollout_once(
         completion_text = rollout_outputs.get("text") or tokenizer.decode(
             rollout_outputs["completion_ids"], skip_special_tokens=True
         )
+        
+        # Debug: Show completion quality on first turn
+        if turn == 0:
+            print(f"  [DEBUG] Completion IDs count: {len(rollout_outputs['completion_ids'])}", flush=True)
+            print(f"  [DEBUG] Raw completion IDs (first 10): {rollout_outputs['completion_ids'][:10]}", flush=True)
+            print(f"  [DEBUG] Completion text length: {len(completion_text)}", flush=True)
+            print(f"  [DEBUG] Full completion text: {completion_text!r}", flush=True)
+            if not completion_text.strip():
+                print(f"  [WARNING] Empty completion text! This suggests model generation is failing.", flush=True)
 
         # Extract and validate recommendation
         movie_rec = extract_movie_recommendation(completion_text)
+        
+        # Debug: print raw output and extraction attempt
+        if turn == 0:  # Print details only on first turn to avoid spam
+            print(f"  [DEBUG EXTRACTION] Raw completion_text (first 200 chars): {completion_text[:200]!r}", flush=True)
+            print(f"  [DEBUG EXTRACTION] Extracted movie: {movie_rec}", flush=True)
+        
         if not movie_rec:
+            print(f"  [DEBUG] turn {turn+1}: Extraction FAILED, using fallback. Raw completion: {completion_text[:100]!r}", flush=True)
             movie_rec = "The Shawshank Redemption"  # fallback
 
         # Step environment
@@ -628,14 +680,23 @@ def main() -> None:
             episode_overall_rewards.append(episode["overall_reward"])
             print(f"[DEBUG] episode {i+1}/{len(prompts)} done — turns={len(episode['overall_reward'])}, avg_reward={sum(episode['overall_reward'])/max(1,len(episode['overall_reward'])):.3f}", flush=True)
 
+        # Flatten nested reward lists for reward functions
+        flat_genre_rewards = [r for rewards_list in episode_genre_rewards for r in rewards_list]
+        flat_quality_rewards = [r for rewards_list in episode_quality_rewards for r in rewards_list]
+        flat_repeat_rewards = [r for rewards_list in episode_repeat_rewards for r in rewards_list]
+        flat_overall_rewards = [r for rewards_list in episode_overall_rewards for r in rewards_list]
+        
+        # Debug: Show shapes
+        print(f"[DEBUG ROLLOUT] Flattened reward shapes - genre: {len(flat_genre_rewards)}, quality: {len(flat_quality_rewards)}, repeat: {len(flat_repeat_rewards)}, overall: {len(flat_overall_rewards)}", flush=True)
+
         return {
             "prompt_ids": episode_prompt_ids,
             "completion_ids": episode_completion_ids,
             "logprobs": episode_logprobs,
-            "genre_match_reward": episode_genre_rewards,
-            "quality_reward": episode_quality_rewards,
-            "no_repeat_reward": episode_repeat_rewards,
-            "overall_reward": episode_overall_rewards,
+            "genre_match_reward": flat_genre_rewards,
+            "quality_reward": flat_quality_rewards,
+            "no_repeat_reward": flat_repeat_rewards,
+            "overall_reward": flat_overall_rewards,
         }
 
     # Initialize trainer
@@ -653,6 +714,13 @@ def main() -> None:
         args=grpo_config,
         rollout_func=rollout_func,
     )
+    
+    # Validate model setup
+    print(f"✓ Model device: {trainer.model.device}", flush=True)
+    print(f"✓ Model dtype: {trainer.model.dtype}", flush=True)
+    print(f"✓ Tokenizer vocab size: {tokenizer.vocab_size}", flush=True)
+    if not hasattr(tokenizer, 'chat_template') or tokenizer.chat_template is None:
+        print(f"⚠️  WARNING: Tokenizer has no chat_template, may affect formatting", flush=True)
 
     # Train
     print("\n" + "=" * 70)
