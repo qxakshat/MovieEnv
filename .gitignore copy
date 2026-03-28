@@ -1,0 +1,79 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+venv/
+ENV/
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+*.sublime-project
+*.sublime-workspace
+
+# Jupyter
+.ipynb_checkpoints/
+*.ipynb_checkpoints
+
+# ML/Data
+*.h5
+*.pkl
+*.pickle
+*.joblib
+outputs/
+checkpoints/
+models/
+*.onnx
+
+# Logs
+logs/
+*.log
+runs/
+
+# Environment
+.env
+.env.local
+.venv.local
+
+# OS
+.DS_Store
+Thumbs.db
+*.tmp
+
+# Temporary
+*.bak
+*~
+.~*
+
+# HF Cache
+transformers_cache/
+huggingface/
+
+# Docker
+*.dockerignore
+docker-compose.override.yml
+
+# Git
+.gitkeep

@@ -1,0 +1,88 @@
+version: '3.8'
+
+services:
+  # Main training/inference service
+  movie-rec-env:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: movie-recommendation-env:latest
+    container_name: movie-rec-env
+
+    # Environment variables
+    environment:
+      - CUDA_VISIBLE_DEVICES=0
+      - HF_TOKEN=${HF_TOKEN}
+      - TRANSFORMERS_CACHE=/models
+      - HF_HOME=/models
+
+    # Volumes
+    volumes:
+      - ./outputs:/app/outputs
+      - ./logs:/app/logs
+      - ./models:/models
+      - ./data:/app/data
+
+    # GPU support
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [ gpu ]
+
+    # Network
+    ports:
+      - "8000:8000"
+
+    # Restart policy
+    restart: unless-stopped
+
+    # Logging
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  # Jupyter notebook server for experimentation
+  jupyter:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: movie-recommendation-env:latest
+
+    container_name: movie-rec-jupyter
+
+    command: jupyter notebook --ip=0.0.0.0 --port=8888 --no-browser --allow-root
+
+    environment:
+      - JUPYTER_ENABLE_LAB=yes
+      - HF_TOKEN=${HF_TOKEN}
+
+    volumes:
+      - ./notebooks:/app/notebooks
+      - ./data:/app/data
+      - ./models:/models
+      - ./src:/app/src
+
+    ports:
+      - "8888:8888"
+
+    depends_on:
+      - movie-rec-env
+
+    restart: unless-stopped
+
+volumes:
+  models:
+    driver: local
+  outputs:
+    driver: local
+  logs:
+    driver: local
+
+networks:
+  default:
+    name: movie-rec-network
